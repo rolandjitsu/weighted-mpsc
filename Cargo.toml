@@ -1,0 +1,29 @@
+# A bounded tokio mpsc channel that bounds by total message weight, not count.
+[package]
+name = "weighted-mpsc"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "A bounded tokio mpsc channel that bounds by the total weight (e.g. bytes) of in-flight messages, not their count."
+repository = "https://github.com/rolandjitsu/weighted-mpsc"
+keywords = ["tokio", "mpsc", "channel", "backpressure", "async"]
+categories = ["asynchronous", "concurrency"]
+
+[features]
+default = ["weigh-std"]
+# Convenience Weigh impls for std byte/text types (Vec<u8>, String, Box<[u8]>).
+weigh-std = []
+# Weigh impls for the `bytes` crate (Bytes, BytesMut); pulls in `bytes`.
+weigh-bytes = ["dep:bytes"]
+
+[dependencies]
+tokio = { version = "1", features = ["sync"] }
+bytes = { version = "1", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "throughput"
+harness = false
