@@ -116,7 +116,8 @@ The weight accounting adds one semaphore acquire and release per message - about
 36 ns each, or roughly 30% of throughput on this all-in-memory micro-benchmark.
 In a pipeline whose cost is dominated by real work or I/O, that is negligible.
 Reproduce with `cargo bench`; measure on your own hardware and workload before
-drawing conclusions.
+drawing conclusions. Full results across x86-64 and arm64 at 1 to 20 cores are in
+[BENCHMARKS.md](./BENCHMARKS.md).
 
 ## Install
 
