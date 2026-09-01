@@ -102,6 +102,25 @@ bounds what runs *alongside* a message, not the size of a single one). Size the
 budget at or above your largest message, or use `Reject`/`Drop`, if you need the
 budget to be a hard ceiling.
 
+### Non-blocking send
+
+`try_send` is the non-blocking alternative to `send`: it delivers the message if
+there is room right now, or returns `TrySendError::Full` (does not consume the
+message) instead of waiting for the budget or the count buffer. `Closed` and
+`TooLarge` mean the same as for `send`.
+
+```rust
+use weighted_mpsc::{channel, TrySendError};
+
+let (tx, _rx) = channel::<Vec<u8>>(16, 4096);
+match tx.try_send(vec![0u8; 1024]) {
+    Ok(()) => {}                                // delivered
+    Err(TrySendError::Full(msg)) => {}          // no room now; `msg` not consumed
+    Err(TrySendError::Closed(_)) => {}          // receiver dropped
+    Err(TrySendError::TooLarge(_)) => {}        // over budget, policy is Reject
+}
+```
+
 ## Benchmark
 
 Sending and receiving 10,000 messages of 1 KiB each, against a raw count-bounded
@@ -128,9 +147,9 @@ cargo add weighted-mpsc
 ## Status / scope
 
 Early, single-maintainer software. The surface is intentionally small: a weighted
-sender/receiver, the `Lease` guard, and the oversized policy. Not here yet, and
-possibly worth adding: a `try_send` and a `futures::Stream` receiver.
-Contributions welcome.
+sender/receiver (blocking `send` and non-blocking `try_send`), the `Lease` guard,
+and the oversized policy. Not here yet, and possibly worth adding: a
+`futures::Stream` receiver. Contributions welcome.
 
 ## License
 

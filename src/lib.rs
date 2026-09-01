@@ -39,7 +39,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 /// The weight budget is capped at `u32::MAX` (about 4 GiB) because a single
 /// `acquire_many` takes a `u32`; [`Builder::build`] panics above that. Individual
@@ -130,10 +130,10 @@ pub enum Oversized {
 /// The error returned by [`WeightedSender::send`].
 pub enum SendError<T> {
     /// The receiver (and every clone of it) was dropped, so the message could not
-    /// be delivered. Carries the message back.
+    /// be delivered. Does not consume the message.
     Closed(T),
     /// The message weighs more than the whole budget and the channel's [`Oversized`]
-    /// policy is [`Oversized::Reject`]. Carries the message back.
+    /// policy is [`Oversized::Reject`]. Does not consume the message.
     TooLarge(T),
 }
 
@@ -165,6 +165,53 @@ impl<T> fmt::Display for SendError<T> {
 }
 
 impl<T> std::error::Error for SendError<T> {}
+
+/// The error returned by [`WeightedSender::try_send`].
+pub enum TrySendError<T> {
+    /// There is no room right now: admitting the message would exceed the weight
+    /// budget, or the count buffer is full. A later `try_send` may succeed once the
+    /// receiver drains room. Does not consume the message.
+    Full(T),
+    /// The receiver (and every clone of it) was dropped, so the message could not
+    /// be delivered. Does not consume the message.
+    Closed(T),
+    /// The message weighs more than the whole budget and the channel's [`Oversized`]
+    /// policy is [`Oversized::Reject`]. Does not consume the message.
+    TooLarge(T),
+}
+
+impl<T> TrySendError<T> {
+    /// Recover the message that could not be sent.
+    pub fn into_inner(self) -> T {
+        match self {
+            TrySendError::Full(v) | TrySendError::Closed(v) | TrySendError::TooLarge(v) => v,
+        }
+    }
+}
+
+impl<T> fmt::Debug for TrySendError<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TrySendError::Full(_) => f.write_str("TrySendError::Full(..)"),
+            TrySendError::Closed(_) => f.write_str("TrySendError::Closed(..)"),
+            TrySendError::TooLarge(_) => f.write_str("TrySendError::TooLarge(..)"),
+        }
+    }
+}
+
+impl<T> fmt::Display for TrySendError<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TrySendError::Full(_) => {
+                f.write_str("channel full: no room in the weight budget or count buffer")
+            }
+            TrySendError::Closed(_) => f.write_str("channel closed: the receiver was dropped"),
+            TrySendError::TooLarge(_) => f.write_str("message weighs more than the channel budget"),
+        }
+    }
+}
+
+impl<T> std::error::Error for TrySendError<T> {}
 
 /// Observer invoked when a message weighs more than the whole budget: called with
 /// `(message_weight, max_weight)`.
@@ -354,6 +401,63 @@ impl<T: Weigh> WeightedSender<T> {
             })
             .await
             .map_err(|e| SendError::Closed(e.0.value))
+    }
+
+    /// Try to send a message without waiting.
+    ///
+    /// Like [`send`](Self::send), but never waits: if admitting the message would
+    /// exceed the budget, or the count buffer is full, it returns
+    /// [`TrySendError::Full`] right away instead of waiting for room. A message that
+    /// weighs more than the whole budget is handled per the channel's [`Oversized`]
+    /// policy.
+    ///
+    /// # Errors
+    ///
+    /// - [`TrySendError::Full`] if there is no room right now (weight budget or count
+    ///   buffer).
+    /// - [`TrySendError::Closed`] if the receiver has been dropped.
+    /// - [`TrySendError::TooLarge`] if the message weighs more than the budget and
+    ///   the policy is [`Oversized::Reject`].
+    pub fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
+        let weight = value.weight().max(self.min_weight);
+
+        let reserve = if weight > self.max_weight {
+            if let Some(hook) = &self.on_oversized {
+                hook(weight, self.max_weight);
+            }
+            match self.oversized {
+                Oversized::Reject => return Err(TrySendError::TooLarge(value)),
+                Oversized::Drop => return Ok(()),
+                Oversized::Allow => self.max_weight,
+            }
+        } else {
+            weight
+        };
+
+        // `reserve <= max_weight <= MAX_PERMITS` (checked in `build`), so the cast
+        // is lossless.
+        let permit = match Arc::clone(&self.budget).try_acquire_many_owned(reserve as u32) {
+            Ok(permit) => permit,
+            Err(TryAcquireError::NoPermits) => return Err(TrySendError::Full(value)),
+            // The budget is only ever closed by the receiver being dropped (see
+            // `WeightedReceiver::drop`).
+            Err(TryAcquireError::Closed) => return Err(TrySendError::Closed(value)),
+        };
+
+        // On `Full`/`Closed` the returned `Lease` is dropped as we recover the value,
+        // which returns the permit to the budget; only the value goes to the caller.
+        self.tx
+            .try_send(Lease {
+                value,
+                weight: reserve,
+                _permit: permit,
+            })
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(lease) => TrySendError::Full(lease.into_inner()),
+                mpsc::error::TrySendError::Closed(lease) => {
+                    TrySendError::Closed(lease.into_inner())
+                }
+            })
     }
 
     /// The channel's total weight budget (the value passed to [`Builder::new`]).
@@ -670,5 +774,80 @@ mod tests {
         let err = tx.send(msg(1)).await.unwrap_err();
         assert!(matches!(err, SendError::Closed(_)));
         assert_eq!(err.into_inner().0.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn try_send_delivers_when_room() {
+        let (tx, mut rx) = channel::<Msg>(8, 1000);
+        tx.try_send(msg(400)).unwrap();
+        assert_eq!(tx.available_weight(), 600);
+        let d = rx.recv().await.unwrap();
+        assert_eq!(d.weight(), 400);
+    }
+
+    #[tokio::test]
+    async fn try_send_full_when_budget_exhausted() {
+        let (tx, _rx) = channel::<Msg>(64, 1000);
+        tx.try_send(msg(1000)).unwrap(); // budget now full
+        let err = tx.try_send(msg(1)).unwrap_err();
+        assert!(matches!(err, TrySendError::Full(_)));
+        assert_eq!(err.into_inner().0.len(), 1);
+        // The rejected send left the budget untouched.
+        assert_eq!(tx.available_weight(), 0);
+    }
+
+    #[tokio::test]
+    async fn try_send_full_when_count_buffer_full() {
+        // Count buffer of 1 with a generous budget: the second message is refused by
+        // the buffer, not the budget, and its permit must return to the budget.
+        let (tx, _rx) = channel::<Msg>(1, 1000);
+        tx.try_send(msg(10)).unwrap();
+        let err = tx.try_send(msg(10)).unwrap_err();
+        assert!(matches!(err, TrySendError::Full(_)));
+        assert_eq!(tx.available_weight(), 990, "permit returned on buffer-full");
+    }
+
+    #[tokio::test]
+    async fn try_send_closed_after_receiver_dropped() {
+        let (tx, rx) = channel::<Msg>(8, 1000);
+        drop(rx);
+        let err = tx.try_send(msg(1)).unwrap_err();
+        assert!(matches!(err, TrySendError::Closed(_)));
+        assert_eq!(err.into_inner().0.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn try_send_oversized_reject_returns_the_message() {
+        let (tx, _rx) = Builder::new(64, 1000)
+            .oversized(Oversized::Reject)
+            .build::<Msg>();
+        let err = tx.try_send(msg(5000)).unwrap_err();
+        assert!(matches!(err, TrySendError::TooLarge(_)));
+        assert_eq!(tx.available_weight(), 1000, "budget untouched on reject");
+    }
+
+    #[tokio::test]
+    async fn try_send_oversized_drop_silently_discards() {
+        let seen = Arc::new(AtomicUsize::new(0));
+        let seen2 = Arc::clone(&seen);
+        let (tx, _rx) = Builder::new(64, 1000)
+            .oversized(Oversized::Drop)
+            .on_oversized(move |_, _| {
+                seen2.fetch_add(1, Ordering::SeqCst);
+            })
+            .build::<Msg>();
+        tx.try_send(msg(5000)).unwrap(); // discarded, Ok(())
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+        assert_eq!(tx.available_weight(), 1000);
+    }
+
+    #[tokio::test]
+    async fn try_send_oversized_allow_reserves_whole_budget() {
+        let (tx, mut rx) = channel::<Msg>(64, 1000);
+        tx.try_send(msg(5000)).unwrap();
+        assert_eq!(tx.available_weight(), 0);
+        let d = rx.recv().await.unwrap();
+        assert_eq!(d.weight(), 1000);
+        assert_eq!(d.0.len(), 5000, "no bytes dropped or truncated");
     }
 }

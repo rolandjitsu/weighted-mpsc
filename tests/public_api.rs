@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use tokio::time::timeout;
-use weighted_mpsc::{Builder, Oversized, SendError, channel};
+use weighted_mpsc::{Builder, Oversized, SendError, TrySendError, channel};
 
 #[tokio::test]
 async fn end_to_end_backpressure() {
@@ -39,4 +39,18 @@ async fn reject_policy_hands_the_message_back() {
     let err = tx.send("x".repeat(500)).await.unwrap_err();
     assert!(matches!(err, SendError::TooLarge(_)));
     assert_eq!(err.into_inner().len(), 500);
+}
+
+#[tokio::test]
+async fn try_send_refuses_when_full_then_succeeds_after_draining() {
+    let (tx, mut rx) = channel::<Vec<u8>>(32, 4096);
+    tx.try_send(vec![0u8; 4096]).unwrap(); // budget now full
+
+    let err = tx.try_send(vec![1u8; 1]).unwrap_err();
+    assert!(matches!(err, TrySendError::Full(_)));
+    assert_eq!(err.into_inner().len(), 1); // message not consumed
+
+    // Drain the first message, freeing the whole budget, and try again.
+    drop(rx.recv().await.unwrap());
+    tx.try_send(vec![2u8; 1]).unwrap();
 }
