@@ -54,3 +54,43 @@ async fn try_send_refuses_when_full_then_succeeds_after_draining() {
     drop(rx.recv().await.unwrap());
     tx.try_send(vec![2u8; 1]).unwrap();
 }
+
+#[cfg(feature = "stream")]
+#[tokio::test]
+async fn stream_delivers_all_messages_end_to_end() {
+    use futures::StreamExt;
+
+    let (tx, mut rx) = channel::<Vec<u8>>(32, 4096);
+    let producer = tokio::spawn(async move {
+        for _ in 0..5 {
+            tx.send(vec![0u8; 512]).await.unwrap();
+        }
+    });
+
+    let mut got = 0;
+    while let Some(lease) = rx.next().await {
+        assert_eq!(lease.len(), 512); // Lease derefs to the Vec<u8>
+        got += 1;
+    }
+    producer.await.unwrap();
+    assert_eq!(
+        got, 5,
+        "stream yields every message, then ends when senders drop"
+    );
+}
+
+#[cfg(feature = "stream")]
+#[tokio::test]
+async fn stream_lease_holds_budget_until_dropped() {
+    use futures::StreamExt;
+
+    let (tx, mut rx) = channel::<Vec<u8>>(32, 1000);
+    tx.send(vec![0u8; 400]).await.unwrap();
+
+    let lease = rx.next().await.unwrap();
+    assert_eq!(lease.weight(), 400);
+    // The budget stays reserved while the streamed Lease is alive, exactly like recv.
+    assert_eq!(tx.available_weight(), 600);
+    drop(lease);
+    assert_eq!(tx.available_weight(), 1000);
+}
