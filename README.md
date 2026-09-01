@@ -121,6 +121,23 @@ match tx.try_send(vec![0u8; 1024]) {
 }
 ```
 
+### Stream receiver (feature `stream`)
+
+With the opt-in `stream` feature, `WeightedReceiver` implements
+[`futures::Stream`](https://docs.rs/futures-core), yielding the same `Lease` guards
+as `recv`. Drive it with any `StreamExt`:
+
+```rust
+use futures::StreamExt;
+
+while let Some(lease) = rx.next().await {
+    // `lease` derefs to the message; its budget is freed when it drops.
+}
+```
+
+The feature pulls in one small, optional dependency (`futures-core`); the base crate
+stays tokio-only.
+
 ## Benchmark
 
 Sending and receiving 10,000 messages of 1 KiB each, against a raw count-bounded
@@ -148,9 +165,10 @@ cargo add weighted-mpsc
 
 Early, single-maintainer software. The surface is intentionally small: a weighted
 sender/receiver (blocking `send` and non-blocking `try_send`), the `Lease` guard,
-and the oversized policy. Not here yet, and possibly worth adding: a
-`futures::Stream` receiver. Contributions welcome.
+the oversized policy, and an optional `futures::Stream` receiver behind the `stream`
+feature. Contributions welcome.
 
 ## License
 
-[Apache-2.0](./LICENSE). One dependency: `tokio`.
+[Apache-2.0](./LICENSE). One required dependency: `tokio`. Optional, behind
+features: `bytes` (`weigh-bytes`) and `futures-core` (`stream`).

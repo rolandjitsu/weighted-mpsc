@@ -36,7 +36,11 @@
 
 use std::fmt;
 use std::ops::{Deref, DerefMut};
+#[cfg(feature = "stream")]
+use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(feature = "stream")]
+use std::task::{Context, Poll};
 
 use tokio::sync::mpsc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
@@ -527,6 +531,30 @@ impl<T> fmt::Debug for WeightedReceiver<T> {
     }
 }
 
+/// The receiver is a [`Stream`] of [`Lease`]s (behind the `stream` feature). Each
+/// item holds its message's budget until dropped, exactly like
+/// [`recv`](WeightedReceiver::recv); the stream ends once every sender is dropped
+/// and the channel is drained.
+///
+/// Drive it with the combinators from a stream crate, e.g. `futures`:
+///
+/// ```ignore
+/// use futures::StreamExt;
+/// while let Some(lease) = rx.next().await {
+///     // `lease` derefs to the message; its budget is freed when it drops.
+/// }
+/// ```
+///
+/// [`Stream`]: futures_core::Stream
+#[cfg(feature = "stream")]
+impl<T> futures_core::Stream for WeightedReceiver<T> {
+    type Item = Lease<T>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
+    }
+}
+
 /// A received message together with the budget it holds.
 ///
 /// Derefs to the message, so use it as you would the value itself. The budget the
@@ -849,5 +877,48 @@ mod tests {
         let d = rx.recv().await.unwrap();
         assert_eq!(d.weight(), 1000);
         assert_eq!(d.0.len(), 5000, "no bytes dropped or truncated");
+    }
+
+    #[cfg(feature = "stream")]
+    #[tokio::test]
+    async fn stream_yields_lease_and_frees_budget_on_drop() {
+        use std::future::poll_fn;
+
+        use futures_core::Stream;
+
+        let (tx, mut rx) = channel::<Msg>(8, 1000);
+        tx.send(msg(400)).await.unwrap();
+
+        // Consume the receiver through its Stream impl rather than `recv`.
+        let lease = poll_fn(|cx| Pin::new(&mut rx).poll_next(cx)).await.unwrap();
+        assert_eq!(lease.weight(), 400);
+        // Like `recv`, the yielded Lease holds the budget until it is dropped.
+        assert_eq!(tx.available_weight(), 600);
+        drop(lease);
+        assert_eq!(tx.available_weight(), 1000);
+    }
+
+    #[cfg(feature = "stream")]
+    #[tokio::test]
+    async fn stream_ends_when_all_senders_dropped() {
+        use std::future::poll_fn;
+
+        use futures_core::Stream;
+
+        let (tx, mut rx) = channel::<Msg>(8, 1000);
+        tx.send(msg(10)).await.unwrap();
+        drop(tx);
+
+        assert!(
+            poll_fn(|cx| Pin::new(&mut rx).poll_next(cx))
+                .await
+                .is_some()
+        );
+        assert!(
+            poll_fn(|cx| Pin::new(&mut rx).poll_next(cx))
+                .await
+                .is_none(),
+            "stream ends after the last sender drops and the channel drains"
+        );
     }
 }

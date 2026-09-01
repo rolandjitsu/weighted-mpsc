@@ -15,14 +15,19 @@ default = ["weigh-std"]
 weigh-std = []
 # Weigh impls for the `bytes` crate (Bytes, BytesMut); pulls in `bytes`.
 weigh-bytes = ["dep:bytes"]
+# `futures::Stream` for the receiver; pulls in `futures-core`.
+stream = ["dep:futures-core"]
 
 [dependencies]
 tokio = { version = "1", features = ["sync"] }
 bytes = { version = "1", optional = true }
+futures-core = { version = "0.3", default-features = false, optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+# Drives the `stream` feature's Stream impl in tests via StreamExt::next.
+futures = { version = "0.3", default-features = false, features = ["std"] }
 
 [[bench]]
 name = "throughput"
