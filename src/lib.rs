@@ -15,7 +15,7 @@
 //! Holding the `Lease` while you use the value keeps the bound accurate; dropping
 //! it (or calling [`Lease::into_inner`]) frees the room immediately.
 //!
-//! [recv]: WeightedReceiver::recv
+//! [`recv`]: WeightedReceiver::recv
 //!
 //! ```no_run
 //! use weighted_mpsc::channel;
