@@ -9,31 +9,18 @@
 A bounded [tokio](https://tokio.rs) mpsc channel that bounds the queue by the
 total **weight** of the messages in it, rather than by the number of messages.
 
-## What it does
+Implement `Weigh` for your message type (usually its size in bytes) and give the
+channel a weight budget; a send waits until the messages already in the channel
+leave enough room, then goes through. Use it to cap the total size in flight - for
+example the memory a producer/consumer pipeline holds - however many or few messages
+that is. Weight need not be bytes; any additive measure works (rows, estimated cost,
+etc.).
 
-You implement `Weigh` for your message type (usually returning its size in bytes)
-and give the channel a weight budget. A send waits until the messages already in
-the channel leave enough room for the new one, then goes through.
-
-Use it when messages vary in size and you want to cap the total size in
-flight - for example, to bound the memory a producer/consumer pipeline holds at
-once, regardless of how many or how few messages that turns out to be. Weight does
-not have to be bytes; any additive measure works (rows, estimated cost, etc.).
-
-(This is the technique from
-[How musl (and a lucky accident) cut my Rust service's memory](https://rolandsdev.blog/posts/glibc-to-musl-rust-memory/),
-extracted into a small, reusable crate.)
-
-## How it works
-
-A `tokio::sync::Semaphore` holds the budget: one permit per weight unit. A message
-takes permits equal to its weight while it is in the channel and while the receiver
-still holds the `Lease` that `recv` returns. Dropping the `Lease` returns the
-permits to the budget and frees room for more sends. Because the budget is held
-until the `Lease` is dropped - not just until the message is received - the bound
-covers the message while the consumer is still using it, not only while it sits in
-the queue. Call `Lease::into_inner` to take the value out and free the budget
-immediately if you want looser, plain-channel semantics.
+A `tokio::sync::Semaphore` holds the budget, one permit per weight unit: a message
+takes permits equal to its weight until the `Lease` that `recv` returns is dropped
+(or `Lease::into_inner` is called), which returns them and frees room. Holding the
+`Lease` while you use the value keeps the bound covering it in the consumer, not
+only while it sits in the queue.
 
 ## Usage
 
@@ -92,7 +79,7 @@ let (tx, rx) = Builder::new(16, 64 * 1024 * 1024)
 - `Allow` (default): send it anyway. It reserves the whole budget until it is
   received and its `Lease` dropped, so it runs on its own. The message is delivered
   whole - nothing is dropped or truncated.
-- `Reject`: return `SendError::TooLarge` (which hands the message back); the budget
+- `Reject`: return `SendError::TooLarge` (does not consume the message); the budget
   is left untouched.
 - `Drop`: discard it; `send` returns `Ok(())`. Use `on_oversized` to count or log.
 
@@ -155,20 +142,6 @@ Reproduce with `cargo bench`; measure on your own hardware and workload before
 drawing conclusions. Full results across x86-64 and arm64 at 1 to 20 cores are in
 [BENCHMARKS.md](./BENCHMARKS.md).
 
-## Install
-
-```sh
-cargo add weighted-mpsc
-```
-
-## Status / scope
-
-Early, single-maintainer software. The surface is intentionally small: a weighted
-sender/receiver (blocking `send` and non-blocking `try_send`), the `Lease` guard,
-the oversized policy, and an optional `futures::Stream` receiver behind the `stream`
-feature. Contributions welcome.
-
 ## License
 
-[Apache-2.0](./LICENSE). One required dependency: `tokio`. Optional, behind
-features: `bytes` (`weigh-bytes`) and `futures-core` (`stream`).
+[Apache-2.0](./LICENSE).
