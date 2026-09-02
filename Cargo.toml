@@ -1,7 +1,7 @@
 # A bounded tokio mpsc channel that bounds by total message weight, not count.
 [package]
 name = "weighted-mpsc"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "Apache-2.0"
 description = "A bounded tokio mpsc channel that bounds by the total weight (e.g. bytes) of in-flight messages, not their count."
